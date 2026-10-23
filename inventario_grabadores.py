@@ -11,6 +11,7 @@ Genera dos CSV (separador ';', listos para Excel/GLPI):
   - inventario_equipos_AAAAMMDD_HHMM.csv   (un renglón por equipo)
   - inventario_camaras_AAAAMMDD_HHMM.csv   (un renglón por canal/cámara: nombre, IP, estado)
 La lista de equipos se guarda en equipos.json (SIN usuario ni contraseña).
+Opcional por equipo en equipos.json: "bahias": N (bahías físicas) si el equipo no las informa por API.
 """
 import csv, json, os, queue, random, re, threading
 import tkinter as tk
@@ -44,9 +45,16 @@ POR_DEFECTO = [
 ]
 
 COLS_EQUIPO = ["Base", "Nombre", "IP", "Marca", "Tipo", "Modelo", "Serial", "MAC", "Firmware",
-               "Canales_total", "Canales_en_uso", "Discos", "Capacidad_TB", "Usado_TB",
+               "Canales_total", "Canales_en_uso", "Discos", "Bahias_total", "Bahias_libres",
+               "Discos_sin_asignar", "Capacidad_TB", "Usado_TB",
                "Estado_discos", "Estado_consulta", "Fecha_consulta"]
-COLS_CAMARA = ["Equipo", "Canal", "Nombre_camara", "IP_camara", "Estado"]
+COLS_CAMARA = ["Equipo", "Canal", "Nombre_camara", "IP_camara", "Modelo_camara", "MAC_camara", "Estado"]
+
+# Estados de disco (en minúsculas) para clasificar. Ajustables si algún equipo usa otros textos.
+HIK_VACIO = {"notexist", "nodisk", "none", "empty"}                       # bahía sin disco
+HIK_SIN_ASIGNAR = {"unformatted", "uninitialized", "unrecordhostformatted", "mismatch"}
+DAHUA_SIN_ASIGNAR = {"unassigned", "unknown", "none", "unformatted"}
+DAHUA_TIPOS_GENERICOS = {"", "ipc", "dvr", "nvr", "xvr", "hcvr", "ptz", "remote"}
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -111,6 +119,45 @@ def xt(el, ruta):
         return ""
     n = el.find(ruta)
     return (n.text or "").strip() if n is not None and n.text else ""
+
+
+def por_sufijo(dic, *sufijos):
+    """Primer valor no vacío cuya clave (en minúsculas) termina en alguno de los sufijos."""
+    for suf in sufijos:
+        for k, v in dic.items():
+            if v and k.lower().split(".")[-1] == suf:
+                return v
+    return ""
+
+
+def tag_desc(el, *nombres):
+    """Texto del primer descendiente cuyo tag (sin mayúsculas) coincide con alguno de los nombres."""
+    if el is None:
+        return ""
+    for nombre in nombres:
+        for n in el.iter():
+            if n.tag.lower() == nombre and n.text and n.text.strip():
+                return n.text.strip()
+    return ""
+
+
+def bahias_manual(d):
+    try:
+        return int(d.get("bahias"))
+    except (TypeError, ValueError):
+        return ""
+
+
+def resumen_bahias(row, d, total_api, instalados, sin_asignar, lista_trae_vacios=False):
+    """Rellena Bahias_total / Bahias_libres / Discos_sin_asignar sin inventar datos.
+    Total de bahías: lo que informe el equipo > valor manual 'bahias' del equipos.json >
+    (solo si la lista de discos incluye bahías vacías) el tamaño de esa lista."""
+    total = total_api or bahias_manual(d) or (lista_trae_vacios and "") or ""
+    row["Discos"] = instalados
+    row["Discos_sin_asignar"] = sin_asignar
+    if total != "":
+        row["Bahias_total"] = total
+        row["Bahias_libres"] = max(int(total) - instalados, 0)
 
 
 def nueva_fila(d):
@@ -192,15 +239,36 @@ def consultar_dahua(d, user, pwd, timeout, dbg):
         nombre = r.get("name") or r.get("videoinputs[0].name") or r.get("devicename") or ""
         return r.get("address", ""), nombre
 
+    # Información de cada cámara remota según el equipo (modelo / MAC), por canal
+    info_cam = {}
+    for k, v in kv(g("/cgi-bin/api/LogicDeviceManager/getCameraInfo?channel=All", "camera_info")).items():
+        m = re.match(r"camera\[(\d+)\]\.deviceinfo\.(.+)$", k, re.I)
+        if m:
+            info_cam.setdefault(int(m.group(1)), {})[m.group(2).lower()] = v
+
+    def modelo_mac(r, canal):
+        """Modelo y MAC de la cámara: primero el registro RemoteDevice, luego getCameraInfo."""
+        fuentes = [r or {}, info_cam.get(canal, {})]
+        modelo = mac = ""
+        for f in fuentes:
+            modelo = modelo or por_sufijo(f, "model", "devicemodel", "modelname")
+            mac = mac or por_sufijo(f, "mac", "macaddress", "physicaladdress")
+            if not modelo:
+                t = por_sufijo(f, "devicetype")
+                modelo = t if t.lower() not in DAHUA_TIPOS_GENERICOS else ""
+        return modelo, mac
+
     usados_remotos = set()
     n_canales = max(total, len(estados), (max(titulos) + 1) if titulos else 0)
     for i in range(n_canales):
         st = estados.get(i, {})
         conectado = st.get("connectionstate", "").lower() == "connected"
         ip_cam = ""
+        r_cam = None
         uuid = st.get("uuid", "")
         if uuid and uuid in remotos:
             ip_cam = datos_remoto(remotos[uuid])[0]
+            r_cam = remotos[uuid]
             usados_remotos.add(uuid)
         if not ip_cam:
             # 1) el id del remoto suele terminar en el índice del canal (..._INFO_0 = canal 1)
@@ -208,6 +276,7 @@ def consultar_dahua(d, user, pwd, timeout, dbg):
                 m = re.search(r"(\d+)$", rid)
                 if rid not in usados_remotos and m and int(m.group(1)) == i and datos_remoto(r)[0]:
                     ip_cam = datos_remoto(r)[0]
+                    r_cam = r
                     usados_remotos.add(rid)
                     break
         if not ip_cam and titulos.get(i):
@@ -216,22 +285,25 @@ def consultar_dahua(d, user, pwd, timeout, dbg):
                 ip_r, nom_r = datos_remoto(r)
                 if rid not in usados_remotos and ip_r and nom_r.lower() == titulos[i].lower():
                     ip_cam = ip_r
+                    r_cam = r
                     usados_remotos.add(rid)
                     break
         if st:
             estado = "Conectada" if conectado else (st.get("connectionstate") or "Sin conexión")
         else:
             estado = ""
+        mod_c, mac_c = modelo_mac(r_cam, i)
         cams.append({"Equipo": d["nombre"], "Canal": i + 1, "Nombre_camara": titulos.get(i, ""),
-                     "IP_camara": ip_cam, "Estado": estado})
+                     "IP_camara": ip_cam, "Modelo_camara": mod_c, "MAC_camara": mac_c, "Estado": estado})
     # Cámaras remotas que no se pudieron asociar a un canal: se listan igual
     for rid, r in remotos.items():
         if rid in usados_remotos:
             continue
         ip_cam, nombre = datos_remoto(r)
         if ip_cam:
+            mod_c, mac_c = modelo_mac(r, -1)
             cams.append({"Equipo": d["nombre"], "Canal": "", "Nombre_camara": nombre,
-                         "IP_camara": ip_cam,
+                         "IP_camara": ip_cam, "Modelo_camara": mod_c, "MAC_camara": mac_c,
                          "Estado": "Habilitada" if r.get("enable", "").lower() == "true" else "Deshabilitada"})
 
     row["Canales_total"] = total or n_canales or ""
@@ -241,29 +313,61 @@ def consultar_dahua(d, user, pwd, timeout, dbg):
     elif remotos:
         row["Canales_en_uso"] = sum(1 for r in remotos.values() if r.get("enable", "").lower() == "true")
 
-    # Discos
+    # Discos: un disco físico = un "info[n]"; sus "detail[m]" son particiones
     disk = kv(g("/cgi-bin/storageDevice.cgi?action=getDeviceAllInfo", "disk"))
-    caps, usados, estd = {}, {}, {}
+    discos = {}
     for k, v in disk.items():
         m = re.match(r"list\.info\[(\d+)\]\.detail\[(\d+)\]\.(\w+)$", k, re.I)
         if m:
-            idx, f = (m.group(1), m.group(2)), m.group(3).lower()
-            try:
-                if f == "totalbytes":
-                    caps[idx] = float(v)
-                elif f == "usedbytes":
-                    usados[idx] = float(v)
-            except ValueError:
-                pass
-            if f == "state":
-                estd[idx] = v
-    if caps:
-        row["Discos"] = len(caps)
-        row["Capacidad_TB"] = round(sum(caps.values()) / 1e12, 2)
-        if usados:
-            row["Usado_TB"] = round(sum(usados.values()) / 1e12, 2)
+            discos.setdefault(int(m.group(1)), {"det": {}, "inf": {}})["det"] \
+                .setdefault(int(m.group(2)), {})[m.group(3).lower()] = v
+            continue
+        m = re.match(r"list\.info\[(\d+)\]\.(\w+)$", k, re.I)
+        if m:
+            discos.setdefault(int(m.group(1)), {"det": {}, "inf": {}})["inf"][m.group(2).lower()] = v
+
+    def num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    cap_t = usado_t = 0.0
+    hay_cap = hay_uso = False
+    estd, sin_asignar = [], 0
+    for n, idx in enumerate(sorted(discos)):
+        dk = discos[idx]
+        dets = list(dk["det"].values())
+        for dt in dets:
+            if num(dt.get("totalbytes")) is not None:
+                cap_t += num(dt["totalbytes"]); hay_cap = True
+            if num(dt.get("usedbytes")) is not None:
+                usado_t += num(dt["usedbytes"]); hay_uso = True
+        estado = next((dt["state"] for dt in dets if dt.get("state")), "") or dk["inf"].get("state", "")
+        tipo = next((dt["type"] for dt in dets if "type" in dt), None)
+        total_disco = sum(num(dt.get("totalbytes")) or 0 for dt in dets)
+        # "Sin asignar": solo si el equipo lo dice explícitamente (tipo/estado) o el disco no tiene capacidad útil
+        if ((tipo is not None and tipo.strip().lower() in DAHUA_SIN_ASIGNAR)
+                or estado.strip().lower() in DAHUA_SIN_ASIGNAR
+                or (dets and any("totalbytes" in dt for dt in dets) and total_disco == 0)):
+            sin_asignar += 1
+        estd.append(f"D{n + 1}:{estado or 'OK'}" + (f"({tipo})" if tipo else ""))
+    if hay_cap:
+        row["Capacidad_TB"] = round(cap_t / 1e12, 2)
+    if hay_uso:
+        row["Usado_TB"] = round(usado_t / 1e12, 2)
     if estd:
-        row["Estado_discos"] = "; ".join(f"D{i + 1}:{estd[k]}" for i, k in enumerate(sorted(estd)))
+        row["Estado_discos"] = "; ".join(estd)
+
+    # Total de bahías: intenta las definiciones de producto más comunes (quedan en el debug si no existen)
+    total_bah = ""
+    for nombre in ("MaxHdd", "MaxHDD", "MaxStorageDevice"):
+        r_bah = kv(g(f"/cgi-bin/magicBox.cgi?action=getProductDefinition&name={nombre}", f"bahias_{nombre}"))
+        v_bah = next((x for x in r_bah.values() if x.isdigit()), "")
+        if v_bah:
+            total_bah = int(v_bah)
+            break
+    resumen_bahias(row, d, total_bah, len(discos), sin_asignar)
     row["Estado_consulta"] = "OK"
     return row, cams
 
@@ -295,12 +399,15 @@ def consultar_hikvision(d, user, pwd, timeout, dbg):
     if raiz is not None:
         for c in raiz.iter("InputProxyChannel"):
             proxy[xt(c, "id")] = {"nombre": xt(c, "name"),
-                                  "ip": xt(c, "sourceInputPortDescriptor/ipAddress")}
-    online = {}
+                                  "ip": xt(c, "sourceInputPortDescriptor/ipAddress"),
+                                  "modelo": tag_desc(c, "model", "devicemodel"),
+                                  "mac": tag_desc(c, "macaddress", "mac")}
+    online, extra_st = {}, {}
     raiz = xml(g("/ISAPI/ContentMgmt/InputProxy/channels/status", "proxy_status"))
     if raiz is not None:
         for c in raiz.iter("InputProxyChannelStatus"):
             online[xt(c, "id")] = xt(c, "online").lower() == "true"
+            extra_st[xt(c, "id")] = (tag_desc(c, "model", "devicemodel"), tag_desc(c, "macaddress", "mac"))
 
     # Canales de video (analógicos o ranuras totales)
     entradas = {}
@@ -318,34 +425,59 @@ def consultar_hikvision(d, user, pwd, timeout, dbg):
             cams.append({"Equipo": d["nombre"], "Canal": cid,
                          "Nombre_camara": proxy[cid]["nombre"] or entradas.get(cid, {}).get("nombre", ""),
                          "IP_camara": proxy[cid]["ip"],
+                         "Modelo_camara": proxy[cid]["modelo"] or extra_st.get(cid, ("", ""))[0],
+                         "MAC_camara": proxy[cid]["mac"] or extra_st.get(cid, ("", ""))[1],
                          "Estado": "Conectada" if online.get(cid) else "Sin conexión"})
         row["Canales_en_uso"] = sum(1 for v in online.values() if v) if online else ""
         row["Canales_total"] = max(len(entradas), len(proxy))
     elif entradas:
         for cid in sorted(entradas, key=clave):
             cams.append({"Equipo": d["nombre"], "Canal": cid, "Nombre_camara": entradas[cid]["nombre"],
-                         "IP_camara": "", "Estado": "Habilitado" if entradas[cid]["hab"] else "Deshabilitado"})
+                         "IP_camara": "", "Modelo_camara": "", "MAC_camara": "",
+                         "Estado": "Habilitado" if entradas[cid]["hab"] else "Deshabilitado"})
         row["Canales_total"] = len(entradas)
         row["Canales_en_uso"] = sum(1 for e in entradas.values() if e["hab"])
 
-    # Discos
+    # Discos: la lista puede incluir bahías vacías (status notexist) o solo los discos presentes
     raiz = xml(g("/ISAPI/ContentMgmt/Storage", "storage"))
-    if raiz is not None:
-        discos = list(raiz.iter("hdd"))
+    hdds = list(raiz.iter("hdd")) if raiz is not None else []
+    if not hdds:
+        raiz = xml(g("/ISAPI/ContentMgmt/Storage/hdd", "hdd"))
+        hdds = list(raiz.iter("hdd")) if raiz is not None else []
+    if hdds:
         cap = lib = 0.0
-        estd = []
-        for i, hd in enumerate(discos):
+        estd, instalados, sin_asignar, vacios = [], 0, 0, 0
+        for i, hd in enumerate(hdds):
+            est = xt(hd, "status").lower()
             try:
-                cap += float(xt(hd, "capacity"))
-                lib += float(xt(hd, "freeSpace"))
+                c_hd = float(xt(hd, "capacity") or 0)
+            except ValueError:
+                c_hd = 0.0
+            if est in HIK_VACIO or (est == "" and c_hd == 0):
+                vacios += 1
+                estd.append(f"B{i + 1}:vacía")
+                continue
+            instalados += 1
+            if est in HIK_SIN_ASIGNAR:
+                sin_asignar += 1
+            try:
+                cap += c_hd
+                lib += float(xt(hd, "freeSpace") or 0)
             except ValueError:
                 pass
             estd.append(f"D{i + 1}:{xt(hd, 'status')}")
-        if discos:
-            row["Discos"] = len(discos)
-            row["Capacidad_TB"] = round(cap / 1024 / 1024, 2)   # el equipo informa en MB
-            row["Usado_TB"] = round((cap - lib) / 1024 / 1024, 2)
-            row["Estado_discos"] = "; ".join(estd)
+        # Capacidad máxima de bahías según el equipo (si la expone)
+        total_api = ""
+        cp = xml(g("/ISAPI/ContentMgmt/Storage/hdd/capabilities", "hdd_caps"))
+        if cp is not None:
+            for n in cp.iter("id"):
+                if (n.get("max") or "").isdigit():
+                    total_api = int(n.get("max"))
+                    break
+        resumen_bahias(row, d, total_api or (len(hdds) if vacios else ""), instalados, sin_asignar)
+        row["Capacidad_TB"] = round(cap / 1024 / 1024, 2)   # el equipo informa en MB
+        row["Usado_TB"] = round((cap - lib) / 1024 / 1024, 2)
+        row["Estado_discos"] = "; ".join(estd)
     row["Estado_consulta"] = "OK"
     return row, cams
 
@@ -683,18 +815,21 @@ class App:
         self._link(top, "← Volver a equipos", lambda: self._ir("acceso")).pack(side="right", padx=22)
 
         tk.Label(f, text=esp("EQUIPOS"), bg=BG, fg=TXT, font=(FONT, 8, "bold")).pack(anchor="w", padx=54)
-        marco, self.tr_eq = self._tree(f, (("nombre", "Nombre", 100), ("ip", "IP", 110), ("marca", "Marca", 70),
-                                           ("tipo", "Tipo", 45), ("modelo", "Modelo", 130), ("serial", "Serial", 170),
-                                           ("mac", "MAC", 110), ("total", "Canales", 55), ("uso", "En uso", 50),
-                                           ("cap", "TB", 55), ("estado", "Estado", 190)), height=9)
+        marco, self.tr_eq = self._tree(f, (("nombre", "Nombre", 90), ("ip", "IP", 105), ("marca", "Marca", 65),
+                                           ("tipo", "Tipo", 40), ("modelo", "Modelo", 110), ("serial", "Serial", 120),
+                                           ("mac", "MAC", 120), ("total", "Canales", 55), ("uso", "En uso", 50),
+                                           ("cap", "TB", 45), ("bah", "Bahías", 55), ("disc", "Discos", 50),
+                                           ("lib", "Libres", 50), ("sina", "Sin asig.", 60),
+                                           ("estado", "Estado", 170)), height=9)
         marco.pack(fill="x", padx=54, pady=(4, 12))
         self.tr_eq.bind("<<TreeviewSelect>>", self._filtrar_camaras)
 
         tk.Label(f, text=esp("CÁMARAS") + "   (selecciona un equipo para filtrar; sin selección se muestran todas)",
                  bg=BG, fg=TXT, font=(FONT, 8, "bold")).pack(anchor="w", padx=54)
-        marco, self.tr_cam = self._tree(f, (("equipo", "Equipo", 110), ("canal", "Canal", 55),
-                                            ("nombre", "Nombre cámara", 240), ("ip", "IP cámara", 140),
-                                            ("estado", "Estado", 120)))
+        marco, self.tr_cam = self._tree(f, (("equipo", "Equipo", 100), ("canal", "Canal", 50),
+                                            ("nombre", "Nombre cámara", 200), ("ip", "IP cámara", 120),
+                                            ("modelo", "Modelo cámara", 150), ("mac", "MAC cámara", 130),
+                                            ("estado", "Estado", 100)))
         marco.pack(fill="both", expand=True, padx=54, pady=(4, 30))
 
     def _ir(self, pagina):
@@ -986,7 +1121,8 @@ class App:
             self.tr_eq.insert("", "end", iid=str(i), tags=("ok" if r["Estado_consulta"] == "OK" else "err",),
                               values=(r["Nombre"], r["IP"], r["Marca"], r["Tipo"], r["Modelo"], r["Serial"],
                                       r["MAC"], r["Canales_total"], r["Canales_en_uso"], r["Capacidad_TB"],
-                                      r["Estado_consulta"]))
+                                      r["Bahias_total"], r["Discos"], r["Bahias_libres"],
+                                      r["Discos_sin_asignar"], r["Estado_consulta"]))
         self._filtrar_camaras()
 
     @staticmethod
@@ -1005,7 +1141,8 @@ class App:
         for i in idxs:
             for c in self.res_camaras.get(i, []):
                 self.tr_cam.insert("", "end", tags=(self._tag_cam(c["Estado"]),),
-                                   values=(c["Equipo"], c["Canal"], c["Nombre_camara"], c["IP_camara"], c["Estado"]))
+                                   values=(c["Equipo"], c["Canal"], c["Nombre_camara"], c["IP_camara"],
+                                           c.get("Modelo_camara", ""), c.get("MAC_camara", ""), c["Estado"]))
 
     def exportar(self):
         if not self.res_equipos:
